@@ -328,10 +328,82 @@ const sunHaloMat = new THREE.SpriteMaterial({
 const sunHalo = new THREE.Sprite(sunHaloMat);
 scene.add(sunHalo);
 
-// ─── nearby stars (streamed in by loadStars()) ───────────────────────────
-// `starSprites` is sorted ascending by heliocentric distance after load so
-// the slider can show "the N closest" by simply slicing a prefix.
-const starSprites = [];
+// ─── nearby stars: one THREE.Points, one draw call ──────────────────────
+// 100 k Sprite objects = 100 k matrix updates + frustum checks + draw calls
+// per frame, which made rotation choppy when the whole cloud was on screen.
+// Pack everything into a single Points geometry instead: per-vertex position,
+// color, and size attributes; the shader does world-size → pixel projection
+// itself. `starData` keeps the per-star metadata in parallel index order for
+// hover/pin lookups.
+const STAR_CAP = 110000;                       // matches build_dataset.py MAX_KEEP
+const starPositions = new Float32Array(STAR_CAP * 3);
+const starColorsBuf = new Float32Array(STAR_CAP * 3);
+const starSizes     = new Float32Array(STAR_CAP);
+const starIndices   = new Float32Array(STAR_CAP);   // 0..N for visibility cull
+const starData      = [];
+let starCount = 0;
+
+const starGeom = new THREE.BufferGeometry();
+starGeom.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+starGeom.setAttribute('aColor',   new THREE.BufferAttribute(starColorsBuf, 3));
+starGeom.setAttribute('aSize',    new THREE.BufferAttribute(starSizes, 1));
+starGeom.setAttribute('aIndex',   new THREE.BufferAttribute(starIndices, 1));
+starGeom.setDrawRange(0, 0);
+// Skip frustum culling — we never compute a tight bbox, and at this scale a
+// false-cull would hide the entire cloud.
+starGeom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), Infinity);
+
+function makePxScale() {
+  const h = renderer.domElement.height;
+  return h * 0.5 / Math.tan(camera.fov * Math.PI / 360);
+}
+
+const starMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uMap:          { value: starTex },
+    uPxScale:      { value: makePxScale() },
+    uVisibleCount: { value: 25000.0 },
+    uBrightMul:    { value: 1.0 },
+  },
+  vertexShader: /* glsl */`
+    attribute vec3  aColor;
+    attribute float aSize;
+    attribute float aIndex;
+    uniform float uPxScale;
+    uniform float uVisibleCount;
+    uniform float uBrightMul;
+    varying vec3 vColor;
+    void main() {
+      vColor = aColor;
+      // Slider-hidden stars get pushed outside clip space + zero size.
+      if (aIndex >= uVisibleCount) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        return;
+      }
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      float depth = max(-mv.z, 0.01);
+      // World-size → pixel-size: aSize * (renderH/2) / (tan(fov/2) * depth).
+      float px = aSize * uBrightMul * uPxScale / depth;
+      gl_PointSize = clamp(px, 1.0, 256.0);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D uMap;
+    varying vec3 vColor;
+    void main() {
+      vec4 t = texture2D(uMap, gl_PointCoord);
+      gl_FragColor = vec4(vColor * t.rgb * 0.7, t.a);   // 0.7 matches old sprite opacity
+    }
+  `,
+  transparent: true,
+  blending:    THREE.AdditiveBlending,
+  depthWrite:  false,
+});
+const starPoints = new THREE.Points(starGeom, starMat);
+scene.add(starPoints);
+
 // Synced with the slider once its DOM is parsed (see sliderToCount, below).
 // 25000 matches the previous fixed-cutoff dataset count.
 let visibleStarCount = 25000;
@@ -366,35 +438,23 @@ function makeRingGeometry(radius) {
   return g;
 }
 
-function addStarSprite(s) {
+function addStar(s) {
   const { l, b } = eqToGal(s.ra, s.dec);
   const p = galToXYZ(l, b, s.distLy);
   const [r, g, bl] = colorForStar(s);
-  const curated = s.isCurated;
-  // Curated and GAIA stars are rendered identically — they're all real stars.
-  // Previously curated got a 5×-flux boost (bigger sprites + full opacity),
-  // which lit up the cluster of named stars around the Sun against the GAIA
-  // fill. Hover still labels named stars; nothing visual marks them.
-  const mat = new THREE.SpriteMaterial({
-    map: starTex,
-    color: new THREE.Color(r, g, bl),
-    transparent: true,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    opacity: 0.7,
-  });
-  const sprite = new THREE.Sprite(mat);
-  sprite.position.set(p.x, p.y, p.z);
   const absMag = absMagFor(s.vmag ?? 99, s.distLy);
-  const sz = sizeForAbsMag(absMag) * brightnessMul;
-  sprite.scale.set(sz, sz, sz);
-  sprite.userData = { ...s, gx: p.x, gy: p.y, gz: p.z, absMag };
-  // Stars are added in distance order; hide ones past the slider position at
-  // creation time so a 100k load doesn't flash all sprites visible mid-stream.
-  sprite.visible = starSprites.length < visibleStarCount;
-  scene.add(sprite);
-  starSprites.push(sprite);
-  _hoverTargets.push(sprite);
+  const sz = sizeForAbsMag(absMag);
+  const i = starCount;
+  starPositions[i*3  ] = p.x;
+  starPositions[i*3+1] = p.y;
+  starPositions[i*3+2] = p.z;
+  starColorsBuf[i*3  ] = r;
+  starColorsBuf[i*3+1] = g;
+  starColorsBuf[i*3+2] = bl;
+  starSizes[i]   = sz;
+  starIndices[i] = i;
+  starData.push({ ...s, gx: p.x, gy: p.y, gz: p.z, absMag, idx: i });
+  starCount++;
 
   // One concentric ring per planet, colored by classification. The dataset
   // lists planets in NASA-Archive discovery order; sort by semi-major axis
@@ -403,26 +463,36 @@ function addStarSprite(s) {
   if (s.planets && s.planets.length > 0) {
     const orbitKey = (pl) => (
       pl.sma_au   != null ? pl.sma_au :
-      pl.period_d != null ? Math.cbrt(pl.period_d * pl.period_d) :  // ∝ a in solar-mass units
+      pl.period_d != null ? Math.cbrt(pl.period_d * pl.period_d) :
       Infinity
     );
     const ordered = [...s.planets].sort((a, b) => orbitKey(a) - orbitKey(b));
     const shown = Math.min(ordered.length, MAX_RINGS_PER_HOST);
-    for (let i = 0; i < shown; i++) {
-      const cls    = planetClass(ordered[i], absMag);
+    for (let j = 0; j < shown; j++) {
+      const cls    = planetClass(ordered[j], absMag);
       const color  = PLANET_COLORS[cls] ?? PLANET_COLORS.unknown;
-      const radius = RING_BASE_WORLD + RING_STEP_WORLD * i;
+      const radius = RING_BASE_WORLD + RING_STEP_WORLD * j;
       const mat = new THREE.LineBasicMaterial({
         color, transparent: true, opacity: 0.85,
         blending: THREE.AdditiveBlending, depthWrite: false,
       });
       const ring = new THREE.LineLoop(makeRingGeometry(radius), mat);
       ring.position.set(p.x, p.y, p.z);
-      ring.userData = { host: sprite, ringIndex: i, cls };
-      ring.visible = sprite.visible;
+      ring.userData = { starIdx: i, ringIndex: j, cls };
+      ring.visible = i < visibleStarCount;
       planetHostRings.add(ring);
     }
   }
+}
+
+// Commit a streamed-in chunk to the GPU. Cheaper than uploading the full
+// buffer every chunk: bump the draw range and mark only what changed.
+function commitStars() {
+  starGeom.setDrawRange(0, starCount);
+  starGeom.attributes.position.needsUpdate = true;
+  starGeom.attributes.aColor.needsUpdate   = true;
+  starGeom.attributes.aSize.needsUpdate    = true;
+  starGeom.attributes.aIndex.needsUpdate   = true;
 }
 
 // ─── Sun→star sightlines (toggle) ────────────────────────────────────────
@@ -435,16 +505,19 @@ const LINE_OPACITY_MAX = 0.45;
 const LINE_FADE_NEAR = 1.5;   // fully invisible when the closest point is < 1.5 ly
 const LINE_FADE_FAR  = 12;    // fully visible when ≥ 12 ly
 
-function addSunLineForSprite(sprite) {
-  const c = sprite.material.color;
+function addSunLineForStar(idx) {
+  const r  = starColorsBuf[idx*3  ];
+  const g  = starColorsBuf[idx*3+1];
+  const bl = starColorsBuf[idx*3+2];
+  const endpoint = new THREE.Vector3(
+    starPositions[idx*3], starPositions[idx*3+1], starPositions[idx*3+2],
+  );
   const mat = new THREE.LineBasicMaterial({
-    color: new THREE.Color(c.r * 0.7 + 0.15, c.g * 0.7 + 0.15, c.b * 0.7 + 0.20),
+    color: new THREE.Color(r * 0.7 + 0.15, g * 0.7 + 0.15, bl * 0.7 + 0.20),
     transparent: true, opacity: LINE_OPACITY_MAX,
   });
-  const endpoint = sprite.position.clone();
   const geo = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(0, 0, 0),
-    endpoint,
+    new THREE.Vector3(0, 0, 0), endpoint,
   ]);
   const line = new THREE.Line(geo, mat);
   line.userData = { endpoint };
@@ -521,7 +594,7 @@ const infoUnpin = document.getElementById('info-unpin');
 
 let summaryTitle = 'Loading…';
 let summaryBody  = 'fetching star catalog';
-let pinnedSprite = null;
+let pinnedStar   = null;
 
 function _row(k, v) {
   return `<div class="k">${k}</div><div class="v">${v}</div>`;
@@ -565,9 +638,9 @@ function buildStarBody(d) {
 }
 
 function renderInfoPanel() {
-  if (pinnedSprite) {
-    infoTitle.textContent = pinnedSprite.userData.name;
-    infoBody.innerHTML = buildStarBody(pinnedSprite.userData);
+  if (pinnedStar) {
+    infoTitle.textContent = pinnedStar.name;
+    infoBody.innerHTML = buildStarBody(pinnedStar);
     infoUnpin.hidden = false;
   } else {
     infoTitle.textContent = summaryTitle;
@@ -578,10 +651,10 @@ function renderInfoPanel() {
 function setSummary(title, body) {
   summaryTitle = title;
   summaryBody = body;
-  if (!pinnedSprite) renderInfoPanel();
+  if (!pinnedStar) renderInfoPanel();
 }
-function pinStar(sprite) { pinnedSprite = sprite; renderInfoPanel(); }
-function unpinStar()     { pinnedSprite = null;   renderInfoPanel(); }
+function pinStar(d)  { pinnedStar = d;    renderInfoPanel(); }
+function unpinStar() { pinnedStar = null; renderInfoPanel(); }
 
 infoHead.addEventListener('click', () => infoEl.classList.toggle('collapsed'));
 infoUnpin.addEventListener('click', (e) => { e.stopPropagation(); unpinStar(); });
@@ -645,27 +718,29 @@ async function loadStars() {
   // entry. Reunite them client-side until the catalog is rebuilt.
   data = dedupCuratedGaiaOrphans(data);
   STARS = data;
-  // Sort ascending by distance so the slider can slice "the N closest"
-  // straight from starSprites. Curated stars naturally land near the front
-  // because they're physically nearby; tie-break keeps named ones first.
+  // Sort ascending by distance so the slider can slice "the N closest" via
+  // the uVisibleCount uniform (which simply rejects vertices with aIndex >=
+  // visibleStarCount). Curated stars naturally land near the front because
+  // they're physically nearby; tie-break keeps named ones first.
   data.sort((a, b) => {
     if (a.distLy !== b.distLy) return a.distLy - b.distLy;
     return (b.isCurated ? 1 : 0) - (a.isCurated ? 1 : 0);
   });
 
-  const CHUNK = 500;
+  const CHUNK = 2000;                       // Points means upload is per-chunk, not per-sprite
   for (let i = 0; i < data.length; i += CHUNK) {
     const end = Math.min(i + CHUNK, data.length);
-    for (let j = i; j < end; j++) addStarSprite(data[j]);
+    for (let j = i; j < end; j++) addStar(data[j]);
+    commitStars();
     setSummary('Loading…', `${end.toLocaleString()} / ${data.length.toLocaleString()} stars`);
     refreshCountLabel(visibleStarCount);   // distLy of the Nth-closest grows as more stream in
     // Yield to the browser so each chunk is visible during load.
     await new Promise(r => requestAnimationFrame(r));
   }
 
-  // Sun→star sightlines: 50 closest. starSprites is already distance-sorted.
-  for (let i = 0; i < Math.min(50, starSprites.length); i++) {
-    addSunLineForSprite(starSprites[i]);
+  // Sun→star sightlines: 50 closest. starData is already distance-sorted.
+  for (let i = 0; i < Math.min(50, starCount); i++) {
+    addSunLineForStar(i);
   }
 
   applyVisibleCount(visibleStarCount);
@@ -692,55 +767,63 @@ async function loadStars() {
 // updateStarsForCamera()/raycasting skip invisible ones, so high counts only
 // cost draw-call setup (which Three.js already culls when .visible=false).
 function applyVisibleCount(n) {
-  // Don't clamp to starSprites.length — load may still be streaming. New
-  // sprites read visibleStarCount in addStarSprite() and inherit visibility.
   visibleStarCount = Math.max(0, n);
-  for (let i = 0; i < starSprites.length; i++) {
-    starSprites[i].visible = i < visibleStarCount;
-  }
-  // Rings belong to a host sprite; hide a ring when its host is hidden.
+  starMat.uniforms.uVisibleCount.value = visibleStarCount;
+  // Rings live outside the Points geometry, so they need their own gating.
   for (const ring of planetHostRings.children) {
-    ring.visible = ring.userData.host?.visible !== false;
+    ring.visible = ring.userData.starIdx < visibleStarCount;
   }
-  // Newly-visible sprites might have been created when brightnessMul was a
-  // different value (or before the slider initialised); reapply.
-  applyStarSizes();
 }
 
-// ─── hover with raycasting ───────────────────────────────────────────────
-const hover  = document.getElementById('hover');
-const raycaster = new THREE.Raycaster();
-raycaster.params.Sprite = { threshold: 0 };
-const mouse = new THREE.Vector2();
+// ─── hover + click-pick via screen-space projection ──────────────────────
+// Raycasting 100 k Sprite objects per frame was costing ms — and Points
+// raycasting with per-vertex sizes is unreliable. Instead: project visible
+// points to screen each query and find the closest within a pixel
+// threshold. ~100 k float ops per query → <1 ms.
+const hover = document.getElementById('hover');
 let lastMouse = null;
-// Reused each frame instead of re-spreading [sun, ...starSprites] (allocates
-// 100k refs every frame at full slider).
-const _hoverTargets = [sun];
+const _hoverProj = new THREE.Vector3();
+const PICK_PX = 14;
 
-renderer.domElement.addEventListener('mousemove', (e) => {
-  lastMouse = e;
-  mouse.x =  (e.clientX / window.innerWidth)  * 2 - 1;
-  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+renderer.domElement.addEventListener('mousemove', (e) => { lastMouse = e; });
+renderer.domElement.addEventListener('mouseleave', () => {
+  lastMouse = null; hover.style.display = 'none';
 });
-renderer.domElement.addEventListener('mouseleave', () => { lastMouse = null; hover.style.display = 'none'; });
 
-function pickSprite(clientX, clientY) {
-  mouse.x =  (clientX / window.innerWidth)  * 2 - 1;
-  mouse.y = -(clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(mouse, camera);
-  const hits = raycaster.intersectObjects(_hoverTargets, false);
-  return hits.length > 0 ? hits[0].object : null;
+function pickAt(clientX, clientY) {
+  const halfW = window.innerWidth  * 0.5;
+  const halfH = window.innerHeight * 0.5;
+  let bestData = null;
+  let bestPx2  = PICK_PX * PICK_PX;
+
+  // Test the Sun first (always visible at origin).
+  _hoverProj.set(0, 0, 0).project(camera);
+  if (_hoverProj.z > -1 && _hoverProj.z < 1) {
+    const sx = halfW + _hoverProj.x * halfW;
+    const sy = halfH - _hoverProj.y * halfH;
+    const d2 = (sx - clientX) * (sx - clientX) + (sy - clientY) * (sy - clientY);
+    if (d2 < bestPx2) { bestPx2 = d2; bestData = sun.userData; }
+  }
+
+  const visible = Math.min(visibleStarCount, starCount);
+  for (let i = 0; i < visible; i++) {
+    _hoverProj.set(
+      starPositions[i*3], starPositions[i*3+1], starPositions[i*3+2],
+    ).project(camera);
+    if (_hoverProj.z <= -1 || _hoverProj.z >= 1) continue;
+    const sx = halfW + _hoverProj.x * halfW;
+    const sy = halfH - _hoverProj.y * halfH;
+    const dx = sx - clientX, dy = sy - clientY;
+    const d2 = dx*dx + dy*dy;
+    if (d2 < bestPx2) { bestPx2 = d2; bestData = starData[i]; }
+  }
+  return bestData;
 }
 
 function updateHover() {
   if (!lastMouse) { hover.style.display = 'none'; return; }
-  raycaster.setFromCamera(mouse, camera);
-  // Raycaster skips objects with .visible === false, so slider-hidden
-  // stars are excluded automatically. _hoverTargets is kept in sync inside
-  // addStarSprite() / applyVisibleCount() — never reallocated per frame.
-  const hits = raycaster.intersectObjects(_hoverTargets, false);
-  if (hits.length === 0) { hover.style.display = 'none'; return; }
-  const d = hits[0].object.userData;
+  const d = pickAt(lastMouse.clientX, lastMouse.clientY);
+  if (!d) { hover.style.display = 'none'; return; }
   hover.innerHTML = `<div class="hover-name">${d.name}</div>` + buildStarBody(d);
   hover.style.display = 'block';
   hover.style.left = (lastMouse.clientX + 14) + 'px';
@@ -762,7 +845,7 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   const dt = performance.now() - _pointerDownAt.t;
   _pointerDownAt = null;
   if (dx*dx + dy*dy > 25 || dt > 500) return;  // drag, not click
-  const hit = pickSprite(e.clientX, e.clientY);
+  const hit = pickAt(e.clientX, e.clientY);
   if (hit) pinStar(hit);
 });
 
@@ -825,12 +908,10 @@ function sliderToCount(pos) {
   return Math.round(Math.pow(10, LOG_MIN + t * (LOG_MAX - LOG_MIN)));
 }
 function refreshCountLabel(n) {
-  const eff = Math.min(n, starSprites.length || n);
+  const eff = Math.min(n, starCount || n);
   countLabel.textContent = eff.toLocaleString();
-  // Show the radius of the visible-set in light-years (max distLy among shown).
-  if (starSprites.length > 0 && eff > 0) {
-    const sp = starSprites[Math.min(eff, starSprites.length) - 1];
-    rangeLabel.textContent = fmtLy(sp.userData.distLy);
+  if (starCount > 0 && eff > 0) {
+    rangeLabel.textContent = fmtLy(starData[Math.min(eff, starCount) - 1].distLy);
   } else {
     rangeLabel.textContent = '— ly';
   }
@@ -847,15 +928,16 @@ refreshCountLabel(visibleStarCount);
 // ─── brightness multiplier slider (0.5× → 5×, default 1×) ────────────────
 // Slider stores ×100 (integer steps) to avoid float weirdness — 50..500.
 // Additive blending makes sprite area ≈ perceived flux, so a size scalar IS
-// a brightness scalar. Sizes only change when this value changes — see
-// applyStarSizes().
+// a brightness scalar. The value flows into the uBrightMul uniform; the
+// Sun (still a Sprite) gets its world scale updated via applySunSize().
 let brightnessMul = 1.0;
 const brightSlider = document.getElementById('brightSlider');
 const brightLabel  = document.getElementById('brightLabel');
 function applyBrightness(v) {
   brightnessMul = Math.max(0.5, Math.min(5, v));
   brightLabel.textContent = brightnessMul.toFixed(brightnessMul < 1 ? 2 : 1);
-  applyStarSizes();
+  starMat.uniforms.uBrightMul.value = brightnessMul;
+  applySunSize();
 }
 brightSlider.addEventListener('input', () => {
   applyBrightness(+brightSlider.value / 100);
@@ -867,6 +949,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  starMat.uniforms.uPxScale.value = makePxScale();   // world-size → pixel-size depends on render height
 });
 
 // ─── readout ─────────────────────────────────────────────────────────────
@@ -886,16 +969,9 @@ const _camPos = new THREE.Vector3();
 // nothing here depends on camera position, sizes only need to be re-applied
 // when the brightness slider changes (or when new sprites enter the visible
 // set via the count slider) — not every frame.
-function applyStarSizes() {
-  for (let i = 0; i < starSprites.length; i++) {
-    const sp = starSprites[i];
-    if (!sp.visible) continue;
-    const sz = sizeForAbsMag(sp.userData.absMag) * brightnessMul;
-    sp.scale.set(sz, sz, sz);
-  }
-  // Sun renders identically to any other G2V star — same absolute-magnitude
-  // → world-size conversion. The perspective 1/r factor turns this into a
-  // physical L/r² flux for the viewer.
+// Stars are sized by uBrightMul on the GPU — this just resizes the Sun
+// sprite (which is still a Sprite, not part of the Points geometry).
+function applySunSize() {
   const sunSz = sizeForAbsMag(SUN_ABS_MAG) * brightnessMul;
   sun.scale.set(sunSz, sunSz, sunSz);
   sunHalo.scale.set(sunSz * 3.2, sunSz * 3.2, sunSz * 3.2);
